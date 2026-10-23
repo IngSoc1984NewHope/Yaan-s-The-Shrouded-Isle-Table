@@ -1,0 +1,422 @@
+<?xml version='1.0' encoding='utf-8'?>
+<CheatTable CheatEngineTableVersion="45">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"[01] Initialize Mono Engine / 初始化（先勾选）"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if _G.TSI_CE and _G.TSI_CE.timer then
+  _G.TSI_CE.timer.destroy()
+end
+local T={ flags={stats=false,families=false,reveal=false}, tick=0, fullState=nil,
+          totalRevealed=0, errors=0, version='v0.1 20261021' }
+_G.TSI_CE=T
+
+function T:log(msg) print('[The Shrouded Isle] '..tostring(msg)) end
+function T:valid(x) return type(x)=='number' and x&gt;0x10000 end
+function T:ptr(x)
+  if not self:valid(x) then return nil end
+  local v=readPointer(x)
+  if self:valid(v) then return v end
+  return nil
+end
+function T:fields(klass, required)
+  if not klass or klass==0 then error('Mono class not found') end
+  local f={}
+  for _,entry in ipairs(mono_class_enumFields(klass) or {}) do
+    f[entry.name]={offset=entry.offset,static=entry.isStatic}
+  end
+  for _,name in ipairs(required) do
+    if not f[name] then error('Missing Mono field '..name) end
+  end
+  return f
+end
+function T:fieldptr(obj,field) return self:ptr(obj+field.offset) end
+function T:iterList(listptr)
+  local result={}
+  if not self:valid(listptr) then return result end
+  local bits64=(type(targetIs64Bit)=='function' and targetIs64Bit())
+  local itemoff=bits64 and 0x10 or 0x08
+  local sizeoff=bits64 and 0x18 or 0x0C
+  local arroff=bits64 and 0x20 or 0x10
+  local arroflen=bits64 and 0x18 or 0x0C
+  local ptrsize=bits64 and 8 or 4
+  local n=readInteger(listptr+sizeoff)
+  local arr=self:ptr(listptr+itemoff)
+  if not arr or not n or n&lt;0 or n&gt;512 then return result end
+  local maxn=readInteger(arr+arroflen)
+  if not maxn or maxn&lt;0 or n&gt;maxn or maxn&gt;100000 then return result end
+  for i=0,n-1 do
+    local p=self:ptr(arr+arroff+i*ptrsize)
+    if p then result[#result+1]=p end
+  end
+  return result
+end
+function T:monoString(p)
+  if not self:valid(p) then return '' end
+  local bits64=(type(targetIs64Bit)=='function' and targetIs64Bit())
+  local off=bits64 and 0x10 or 0x08
+  local chars=bits64 and 0x14 or 0x0C
+  local n=readInteger(p+off)
+  if not n or n&lt;0 or n&gt;1024 then return '' end
+  local s=readString(p+chars,math.min(n,120),true)
+  return s or ''
+end
+function T:findClasses()
+  local def={
+    GameManager={'instance','town','peopleList','familyDataList'},
+    TownData={'rd'},
+    ResourceData={'ignorance','fervor','discipline','penitence','obedience'},
+    FamilyData={'familyID','familyName','approval'},
+    PersonData={'name','family','traits'},
+    TraitData={'name','isPositive','revealState'} }
+  for _,domain in ipairs(mono_enumDomains() or {}) do
+    mono_setCurrentDomain(domain)
+    local cls=mono_findClass('','GameManager')
+    if cls and cls~=0 then
+      local ok, result=pcall(function()
+        local classes, fields={},{}
+        for name,req in pairs(def) do
+          local c=mono_findClass('',name)
+          if not c or c==0 then error('Class not found: '..name) end
+          classes[name]=c
+          fields[name]=self:fields(c,req)
+        end
+        local base=mono_class_getStaticFieldAddress(domain,cls)
+        if not self:valid(base) then error('Static base unavailable') end
+        return {classes=classes,fields=fields,domain=domain,base=base}
+      end)
+      if ok then
+        self.classes=result.classes
+        self.f=result.fields
+        self.domain=result.domain
+        self.staticBase=result.base
+        local m=mono_class_findMethod(self.classes.TraitData,'RevealTrait')
+        if m and m~=0 then self.revealMethod=m end
+        return true
+      else self:log('Domain skipped: '..tostring(result)) end
+    end
+  end
+  return false
+end
+function T:gameManager()
+  local gm=self:ptr(self.staticBase+self.f.GameManager.instance.offset)
+  if not gm then return nil end
+  -- Require the current GameManager's town reference to be readable before modifying data.
+  local town=self:fieldptr(gm,self.f.GameManager.town)
+  if not town then return nil end
+  return gm,town
+end
+function T:applyStats(gm,town)
+  local rd=self:fieldptr(town,self.f.TownData.rd)
+  if not rd then return 0 end
+  local changed=0
+  for _,name in ipairs({'ignorance','fervor','discipline','penitence','obedience'}) do
+    local a=rd+self.f.ResourceData[name].offset
+    local v=readInteger(a)
+    if v and v~=100 then
+      if writeInteger(a,100) then changed=changed+1 end
+    end
+  end
+  return changed
+end
+function T:families(gm)
+  return self:iterList(self:fieldptr(gm,self.f.GameManager.familyDataList))
+end
+function T:people(gm)
+  return self:iterList(self:fieldptr(gm,self.f.GameManager.peopleList))
+end
+function T:applyFamilies(gm)
+  local cnt=0
+  for _,fam in ipairs(self:families(gm)) do
+    local a=fam+self.f.FamilyData.approval.offset
+    local v=readInteger(a)
+    if v and v~=100 and writeInteger(a,100) then cnt=cnt+1 end
+  end
+  return cnt
+end
+function T:traitName(td)
+  return self:monoString(self:fieldptr(td,self.f.TraitData.name))
+end
+function T:personName(pd)
+  return self:monoString(self:fieldptr(pd,self.f.PersonData.name))
+end
+function T:familyName(fd)
+  if not fd then return '?' end
+  local name=self:monoString(self:fieldptr(fd,self.f.FamilyData.familyName))
+  if name=='' then name=self:monoString(self:fieldptr(fd,self.f.FamilyData.familyID)) end
+  return name
+end
+function T:allTraits(gm)
+  local out={}
+  for _,pd in ipairs(self:people(gm)) do
+    local list=self:fieldptr(pd,self.f.PersonData.traits)
+    for _,td in ipairs(self:iterList(list)) do
+      out[#out+1]={pd=pd,trait=td}
+    end
+  end
+  return out
+end
+function T:revealAll(gm)
+  if not self.revealMethod then
+    error('TraitData.RevealTrait(bool) Mono method not found')
+  end
+  local count=0
+  for _,record in ipairs(self:allTraits(gm)) do
+    local td=record.trait
+    local a=td+self.f.TraitData.revealState.offset
+    local before=readInteger(a)
+    if before~=nil and (not self.fullState or before~=self.fullState) then
+      -- Calling the original game method avoids guessing TraitRevealState enum values.
+      local _,exc=mono_invoke_method(self.domain,self.revealMethod,td,{{type=vtByte,value=1}})
+      if exc and exc~='' then error('RevealTrait: '..tostring(exc)) end
+      local after=readInteger(a)
+      if after~=nil and after~=before then
+        self.fullState=after
+        count=count+1
+      end
+    end
+  end
+  self.totalRevealed=self.totalRevealed+count
+  return count
+end
+function T:rosterText(gm)
+  local lines={ 'THE SHROUDED ISLE - CHARACTER VIRTUES AND VICES',
+                'Live snapshot; refresh after new characters are generated.','' }
+  local n=0
+  local living=0
+  for _,pd in ipairs(self:people(gm)) do
+    n=n+1
+    local fd=self:fieldptr(pd,self.f.PersonData.family)
+    local positive,negative={},{}
+    for _,td in ipairs(self:iterList(self:fieldptr(pd,self.f.PersonData.traits))) do
+      local pn=self:traitName(td)
+      if pn=='' then pn='(unnamed trait)' end
+      local traitState=readInteger(td+self.f.TraitData.revealState.offset)
+      pn=pn..' [state '..tostring(traitState or '?')..']'
+      if readBytes(td+self.f.TraitData.isPositive.offset,1)==1 then
+        positive[#positive+1]=pn
+      else negative[#negative+1]=pn end
+    end
+    local personName=self:personName(pd)
+    if personName=='' then personName='(unnamed)' end
+    lines[#lines+1]=string.format('%02d | %s | %s',n,self:familyName(fd),personName)
+    lines[#lines+1]='     VIRTUE: '..(#positive&gt;0 and table.concat(positive,', ') or '---')
+    lines[#lines+1]='     VICE:   '..(#negative&gt;0 and table.concat(negative,', ') or '---')
+    lines[#lines+1]=''
+  end
+  lines[#lines+1]=string.format('%d characters total',n)
+  return table.concat(lines,'\r\n')
+end
+function T:showRoster()
+  local gm=self:gameManager()
+  if not gm then error('Enter a playable save before using the roster.') end
+  local result=self:rosterText(gm)
+  local form=createForm(false)
+  form.Caption='The Shrouded Isle - All character traits'
+  form.Width=850
+  form.Height=630
+  local memo=createMemo(form)
+  memo.Align='alClient'
+  memo.ReadOnly=true
+  memo.ScrollBars='ssBoth'
+  memo.WordWrap=false
+  memo.Lines.Text=result
+  form.show()
+  self.rosterForm=form
+  self:log('Roster window opened')
+end
+function T:tickOnce()
+  local gm,town=self:gameManager()
+  if not gm then return end
+  if self.flags.stats then self:applyStats(gm,town) end
+  if self.flags.families then self:applyFamilies(gm) end
+  self.tick=self.tick+1
+  if self.flags.reveal and self.tick%3==0 then self:revealAll(gm) end
+end
+if getOpenedProcessID()==0 then
+  _G.TSI_CE=nil
+  error('Attach Cheat Engine to The Shrouded Isle first')
+end
+local mono=LaunchMonoDataCollector()
+if not mono or mono==0 then
+  _G.TSI_CE=nil
+  error('Mono collector could not attach. Check game process and Mono support')
+end
+if not T:findClasses() then
+  _G.TSI_CE=nil
+  error('Could not locate the game Mono classes/static fields')
+end
+T.timer=createTimer(nil,false)
+T.timer.Interval=1800
+T.timer.OnTimer=function()
+  local ok,err=pcall(function() T:tickOnce() end)
+  if not ok then
+    T.errors=T.errors+1
+    T:log('Update failed: '..tostring(err))
+    T.timer.Enabled=false
+    T:log('Timer stopped to protect game. Uncheck and re-enable initialization after fixing the error.')
+  end
+end
+T.timer.Enabled=true
+T:log('Initialized; select individual functions below after loading a game.')
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if T then
+  if T.timer then T.timer.destroy();T.timer=nil end
+  T:log('Stopped (previously modified values are not reverted).')
+end
+_G.TSI_CE=nil
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"[02] MAX Town Statistics = 100 / 五项统计最大"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+T.flags.stats=true
+T:log('stats enabled')
+local ok,err=pcall(function() T:tickOnce() end)
+if not ok then T:log(tostring(err)) end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if T then T.flags.stats=false; T:log('stats disabled') end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>3</ID>
+      <Description>"[03] MAX All Family Approvals = 100 / 全家族好感最大"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+T.flags.families=true
+T:log('families enabled')
+local ok,err=pcall(function() T:tickOnce() end)
+if not ok then T:log(tostring(err)) end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if T then T.flags.families=false; T:log('families disabled') end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>4</ID>
+      <Description>"[04] AUTO Reveal All Virtues + Vices / 自动公开全部善行罪孽"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+T.flags.reveal=true
+T:log('reveal enabled')
+local ok,err=pcall(function() T:tickOnce() end)
+if not ok then T:log(tostring(err)) end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if T then T.flags.reveal=false; T:log('reveal disabled') end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>5</ID>
+      <Description>"[05] SHOW Character Roster / 查看全部人物善行罪孽（窗口）"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+local ok,err=pcall(function() T:showRoster() end)
+if not ok then error('Roster: '..tostring(err)) end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>6</ID>
+      <Description>"[06] Reveal NOW / 立即完整揭示一次"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+local gm=T:gameManager()
+if not gm then error('Load an active save before revealing traits') end
+local ok,result=pcall(function() return T:revealAll(gm) end)
+if not ok then error('Reveal: '..tostring(result)) end
+T:log('Newly fully revealed traits: '..tostring(result))
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>7</ID>
+      <Description>"[07] Diagnostic Snapshot / 检查地址与数据"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local T=_G.TSI_CE
+if not T then error('Enable [01] Mono initialization first') end
+local gm,town=T:gameManager()
+if not gm then error('Load a playable save before diagnostics') end
+local lines={'THE SHROUDED ISLE - DIAGNOSTICS',
+             'Mono domain: '..string.format('%X',T.domain),
+             'GameManager: '..string.format('%X',gm),
+             'TownData: '..string.format('%X',town)}
+local rd=T:fieldptr(town,T.f.TownData.rd)
+lines[#lines+1]='Town ResourceData: '..(rd and string.format('%X',rd) or 'NIL')
+if rd then
+ for _,n in ipairs({'ignorance','fervor','discipline','penitence','obedience'}) do
+   lines[#lines+1]='  '..n..' = '..tostring(readInteger(rd+T.f.ResourceData[n].offset))
+ end
+end
+local fams=T:families(gm)
+lines[#lines+1]='Family count = '..#fams
+for _,f in ipairs(fams) do
+  lines[#lines+1]='  '..T:familyName(f)..' | approval='..tostring(readInteger(f+T.f.FamilyData.approval.offset))
+end
+local people=T:people(gm)
+lines[#lines+1]='People count = '..#people
+lines[#lines+1]='Traits count = '..#T:allTraits(gm)
+lines[#lines+1]='Detected full reveal enum = '..tostring(T.fullState or 'not yet measured')
+lines[#lines+1]='Auto-reveal total = '..tostring(T.totalRevealed)
+lines[#lines+1]='Timer errors = '..tostring(T.errors)
+local out=table.concat(lines,string.char(10))
+T:log(out)
+showMessage(out)
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+{$asm}</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols />
+</CheatTable>
